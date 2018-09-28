@@ -1,0 +1,13 @@
+run.config:
+  engine: nodejs
+  engine.config:
+    runtime: nodejs-8.12.0
+
+worker.sync:
+  start: sleep 365d
+
+data.influx:
+  image: comocapital/nanobox-influxdb:1.6.3
+  config:
+    http_shared_secret: 'foobar123'
+    http_log_enabled: true

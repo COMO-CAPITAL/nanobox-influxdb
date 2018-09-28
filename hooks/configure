@@ -1,0 +1,234 @@
+#!/usr/bin/env ruby
+
+# hookit is installed as a bundled app, so we need bundler to load it for us
+$:.unshift  '/opt/gonano/hookit/vendor/bundle'
+require 'bundler/setup'
+
+# load hookit/setup to bootstrap hookit and import the dsl
+require 'hookit/setup'
+
+config = converge( Hooky::Influxdb::CONFIG_DEFAULTS, payload[:config] || {} )
+
+dedicated = payload[:component][:dedicated] || false
+
+# make sure the env dir exists
+directory "/data/etc/env.d" do
+  recursive true
+end
+
+# and that it's owned by gonano
+execute "chown gonano /data/etc/env.d"
+
+(payload[:env] || {}).each do |key, value|
+  file "/data/etc/env.d/#{key}" do
+    content value
+    owner 'gonano'
+    group 'gonano'
+    mode 0444
+  end
+end
+
+# Create some ssh host keys
+execute "ssh-keygen -f /opt/gonano/etc/ssh/ssh_host_rsa_key -N '' -t rsa" do
+  not_if { ::File.exists? '/opt/gonano/etc/ssh/ssh_host_rsa_key' }
+end
+
+execute "ssh-keygen -f /opt/gonano/etc/ssh/ssh_host_dsa_key -N '' -t dsa" do
+  not_if { ::File.exists? '/opt/gonano/etc/ssh/ssh_host_dsa_key' }
+end
+
+execute "ssh-keygen -f /opt/gonano/etc/ssh/ssh_host_ecdsa_key -N '' -t ecdsa" do
+  not_if { ::File.exists? '/opt/gonano/etc/ssh/ssh_host_ecdsa_key' }
+end
+
+execute "ssh-keygen -f /opt/gonano/etc/ssh/ssh_host_ed25519_key -N '' -t ed25519" do
+  not_if { ::File.exists? '/opt/gonano/etc/ssh/ssh_host_ed25519_key' }
+end
+
+if payload[:platform] != 'local'
+  # Setup root keys for data migrations
+  directory '/root/.ssh' do
+    recursive true
+    mode 0700
+  end
+
+  file '/root/.ssh/id_rsa' do
+    content payload[:ssh][:admin_key][:private_key]
+    mode 0600
+  end
+
+  file '/root/.ssh/id_rsa.pub' do
+    content payload[:ssh][:admin_key][:public_key]
+  end
+
+  file '/root/.ssh/authorized_keys' do
+    content payload[:ssh][:admin_key][:public_key]
+  end
+
+  # Create some ssh host keys
+  execute "ssh-keygen -f /opt/gonano/etc/ssh/ssh_host_rsa_key -N '' -t rsa" do
+    not_if { ::File.exists? '/opt/gonano/etc/ssh/ssh_host_rsa_key' }
+  end
+
+  execute "ssh-keygen -f /opt/gonano/etc/ssh/ssh_host_dsa_key -N '' -t dsa" do
+    not_if { ::File.exists? '/opt/gonano/etc/ssh/ssh_host_dsa_key' }
+  end
+
+  execute "ssh-keygen -f /opt/gonano/etc/ssh/ssh_host_ecdsa_key -N '' -t ecdsa" do
+    not_if { ::File.exists? '/opt/gonano/etc/ssh/ssh_host_ecdsa_key' }
+  end
+
+  execute "ssh-keygen -f /opt/gonano/etc/ssh/ssh_host_ed25519_key -N '' -t ed25519" do
+    not_if { ::File.exists? '/opt/gonano/etc/ssh/ssh_host_ed25519_key' }
+  end
+
+end
+
+if payload[:logvac_host]
+  # Configure narc
+  template '/opt/gonano/etc/narc.conf' do
+    variables ({
+      uid: payload[:component][:uid],
+      logvac: payload[:logvac_host],
+      svc: 'influxdb'
+    })
+  end
+
+  # ensure log files are created
+  ["/var/log/gonano/influxdb/current"].each do |log_file|
+    if not ::File.exists? "#{log_file}"
+      parent = File.expand_path("..", "#{log_file}")
+      
+      # create the parent directory
+      directory parent do
+        owner 'gonano'
+        group 'gonano'
+        recursive true
+      end
+      
+      # create the log_file
+      file "#{log_file}" do
+        owner 'gonano'
+        group 'gonano'
+        mode  0644
+      end
+    end
+  end
+
+  directory '/etc/service/narc'
+
+  template '/etc/service/narc/run' do
+    mode 0755
+    source 'run-root.erb'
+    variables ({ exec: "/opt/gonano/bin/narcd /opt/gonano/etc/narc.conf" })
+  end
+end
+
+payload[:users].each do |user|
+  execute "echo \"#{user[:username]}:#{user[:password]}\" | chpasswd"
+end
+
+# Install extra packages
+
+# Add extra paths
+if payload[:extra_path_dirs] && payload[:extra_path_dirs].length > 0
+  directory "/data/etc/env.d" do
+    recursive true
+    owner 'gonano'
+    group 'gonano'
+  end
+
+  file "/data/etc/env.d/EXTRA_PATHS" do
+    content payload[:extra_path_dirs].join(":")
+    owner 'gonano'
+    group 'gonano'
+    mode 0444
+  end
+end
+
+if payload[:extra_packages]
+  execute "Install packages" do
+    command "/data/bin/pkgin -y in #{payload[:extra_packages].join(' ')}"
+    path "/data/sbin:/data/bin:/opt/gonano/sbin:/opt/gonano/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    user 'gonano'
+  end
+end
+
+if payload[:extra_steps]
+  payload[:extra_steps].each_with_index do |cmd, i|
+
+    execute "Extra Step: #{cmd}" do
+      command "bash -i -l -c \"#{escape cmd}\""
+      cwd "/data"
+      path "/data/sbin:/data/bin:/opt/gonano/sbin:/opt/gonano/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      user 'gonano'
+    end
+  end
+end
+
+# Set up cron
+
+if payload[:member][:uid] == 1 && ! payload[:cron_jobs].nil?
+  include Hookit::Helper::Cron
+  include Hookit::Helper::Shell
+
+  directory '/opt/nanobox/cron/'
+
+  payload[:cron_jobs].each_with_index do |job, id|
+    template "/opt/nanobox/cron/#{job[:id]}" do
+      owner 'gonano'
+      source 'cron.erb'
+      group 'gonano'
+      mode 0755
+      variables ({
+        component_uid: payload[:component][:uid],
+        member_uid: payload[:member][:uid],
+        logvac_host: payload[:logvac_host],
+        command: escape_shell_string(job[:command]),
+        cron_id: id + 1
+      })
+    end
+  end
+
+  template '/etc/crontab' do
+    mode 0644
+    variables ({ crons: payload[:cron_jobs] })
+  end
+
+end
+
+# Sync time
+
+execute 'sync time' do
+  command "ntpdate -s ntp.ubuntu.com"
+end
+
+# ensure data directory exists
+directory '/data/var/db/influxdb/data' do
+  recursive true
+end
+
+# chown /data/var/db/influxdb for gonano
+execute 'chown /data/var/db/influxdb' do
+  command 'chown -R gonano:gonano /data/var/db/influxdb'
+end
+
+# ensure the etc config directory exists
+directory '/data/etc/influxdb' do
+  recursive true
+end
+
+execute 'chown /data/etc/influxdb' do
+  command 'chown -R gonano:gonano /data/etc/influxdb'
+end
+
+# generate the config file
+template '/data/etc/influxdb/influxdb.conf' do
+  source 'influxdb.conf.erb'
+  mode 0644
+  owner 'gonano'
+  group 'gonano'
+  variables ({
+    config: config
+  })
+end
